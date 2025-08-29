@@ -1,0 +1,119 @@
+# Path to the server list
+$serverListPath = "C:\temp\serverlist.txt"
+
+# Prompt for domain admin credentials
+$credential = Get-Credential -Message "Enter domain admin credentials"
+
+# Remote script block with SAN policy check integrated
+$scriptBlock = {
+    $result = [PSCustomObject]@{
+        Server                         = $env:COMPUTERNAME
+        AllowLocalPolicyMergeRegistry  = "Not Found"
+        AllowLocalFirewallRulesSetting = "Not Checked"
+        DrUserExists                   = $false
+        DrUserInAdminGroup             = $false
+        AzureGuestAgentRunning         = $false
+        SanPolicy                      = "Not Determined"
+    }
+
+    # Check registry for AllowLocalPolicyMerge
+    try {
+        $regPath = "HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile"
+        if (Test-Path $regPath) {
+            $value = Get-ItemProperty -Path $regPath -Name "AllowLocalPolicyMerge" -ErrorAction SilentlyContinue
+            if ($value -and $value.AllowLocalPolicyMerge -eq 1) {
+                $result.AllowLocalPolicyMergeRegistry = "1 (Allowed)"
+            } else {
+                $result.AllowLocalPolicyMergeRegistry = "0 (Not Allowed)"
+            }
+        } else {
+            $result.AllowLocalPolicyMergeRegistry = "Registry path not found"
+        }
+    } catch {
+        $result.AllowLocalPolicyMergeRegistry = "Error: $($_.Exception.Message)"
+    }
+
+    # Check effective setting for local firewall rule merging
+    try {
+        $profile = Get-NetFirewallProfile -Profile Public
+        $result.AllowLocalFirewallRulesSetting = if ($profile.AllowLocalFirewallRules) { "YES" } else { "NO" }
+    } catch {
+        $result.AllowLocalFirewallRulesSetting = "Error: $($_.Exception.Message)"
+    }
+
+    # Check if user druser exists
+    try {
+        $user = Get-LocalUser -Name "druser" -ErrorAction SilentlyContinue
+        if ($user) {
+            $result.DrUserExists = $true
+
+            # Check if druser is in Administrators group
+$admins = Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue
+if ($admins) {
+    foreach ($admin in $admins) {
+        if ($admin.Name -match '\\?druser$') {
+            $result.DrUserInAdminGroup = $true
+            break
+        }
+    }
+}
+
+        }
+    } catch {
+        # ignore errors for missing user or group
+    }
+
+    # Check if WindowsAzureGuestAgent service is running
+    try {
+        $svc = Get-Service -Name "WindowsAzureGuestAgent" -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq 'Running') {
+            $result.AzureGuestAgentRunning = $true
+        }
+    } catch {
+        # ignore errors
+    }
+
+    # Check SAN Policy using diskpart
+    try {
+        $tempFile = [System.IO.Path]::GetTempFileName()
+        Set-Content -Path $tempFile -Value "san"
+
+        try {
+            $diskpartOutput = diskpart /s $tempFile 2>&1 | Out-String
+            $sanPolicyLine = $diskpartOutput -split "`r?`n" | Where-Object { $_ -match 'SAN Policy' }
+
+            if ($sanPolicyLine -and $sanPolicyLine -match 'SAN Policy\s*:\s*(.+)$') {
+                $result.SanPolicy = $matches[1].Trim()
+            } else {
+                $result.SanPolicy = "Not Found"
+            }
+        } finally {
+            Remove-Item -Path $tempFile -ErrorAction SilentlyContinue
+        }
+    } catch {
+        $result.SanPolicy = "Error: $($_.Exception.Message)"
+    }
+
+    return $result
+}
+
+# Read servers from file
+$servers = Get-Content $serverListPath
+
+# Loop through servers
+foreach ($server in $servers) {
+    Write-Host "`n🔍 Checking: $server" -ForegroundColor Cyan
+    try {
+        $output = Invoke-Command -ComputerName $server -ScriptBlock $scriptBlock -Credential $credential -ErrorAction Stop
+
+        Write-Host "👤 druser exists: $($output.DrUserExists)"
+        Write-Host "👑 druser in Administrators group: $($output.DrUserInAdminGroup)"
+        Write-Host "💠 WindowsAzureGuestAgent running: $($output.AzureGuestAgentRunning)"
+        Write-Host "🛡️  Apply local firewall rules (effective setting): $($output.AllowLocalFirewallRulesSetting)"
+        Write-Host "🗂️  Registry AllowLocalPolicyMerge: $($output.AllowLocalPolicyMergeRegistry)"
+        Write-Host "💽 SAN Policy: $($output.SanPolicy)"
+    } catch {
+        Write-Host "❌ Failed to connect to $server" -ForegroundColor Red
+        Write-Host "    $_" -ForegroundColor DarkRed
+    }
+}
