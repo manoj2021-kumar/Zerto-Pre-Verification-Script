@@ -1,0 +1,106 @@
+- name: Generate timestamp and report path
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Generate timestamp
+      set_fact:
+        report_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+
+    - name: Set report path
+      set_fact:
+        report_path: "/tmp/zerto_summary_{{ report_timestamp }}.csv"
+
+    - name: Create CSV header
+      copy:
+        dest: "{{ report_path }}"
+        content: "Report generated at: {{ lookup('pipe', 'date \"+%Y-%m-%d %H:%M:%S %Z\"') }}\nHostname,IP Address,OS Version,Waagent Status,ASM Disk Status,Serial Console Status,Zerto Installation Status"
+        mode: '0644'
+
+- name: Share report path with all hosts
+  hosts: all
+  gather_facts: false
+
+  tasks:
+    - name: Propagate report path from localhost
+      set_fact:
+        report_path: "{{ hostvars['localhost']['report_path'] }}"
+
+- name: Collect server info and prepare report lines
+  hosts: all
+  gather_facts: yes
+  become: yes
+
+  tasks:
+    - name: Get OS version
+      shell: cat /etc/redhat-release
+      register: os_version
+      changed_when: false
+
+    - name: Check waagent service status
+      shell: |
+        if systemctl is-active --quiet waagent; then echo "Running"; else echo "Not Running"; fi
+      register: waagent_status
+      changed_when: false
+
+    - name: Check for ASM disks
+      shell: ls -l /dev/oracleasm/disks/ || true
+      register: asm_disk_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set ASM disk status
+      set_fact:
+        asm_status: "{{ 'Present' if asm_disk_check.stdout_lines | length > 0 else 'Not Present' }}"
+
+    - name: Check serial console status
+      shell: cat /proc/cmdline
+      register: proc_cmdline
+      changed_when: false
+
+    - name: Set serial console status
+      set_fact:
+        serial_console_status: "{{ 'Enabled' if 'tty' in proc_cmdline.stdout else 'Disabled' }}"
+
+    - name: Check if Zerto is installed
+      stat:
+        path: /root/zerto/installation.log
+      register: zerto_log_stat
+      changed_when: false
+      failed_when: false
+
+    - name: Check Zerto installation success
+      shell: grep -q "installation was successfully completed!" /root/zerto/installation.log
+      register: zerto_installed
+      when: zerto_log_stat.stat.exists
+      changed_when: false
+      failed_when: false
+
+    - name: Set Zerto installation status
+      set_fact:
+        zerto_status: "{{ 'Installed' if zerto_installed.rc == 0 else 'Not Installed' }}"
+      when: zerto_log_stat.stat.exists
+
+    - name: Set default Zerto status if log not found
+      set_fact:
+        zerto_status: "Not Installed"
+      when: zerto_log_stat.stat.exists is not defined or not zerto_log_stat.stat.exists
+
+    - name: Build report line
+      set_fact:
+        report_line: "{{ inventory_hostname }},{{ ansible_default_ipv4.address }},{{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }},{{ waagent_status.stdout.strip() }},{{ asm_status }},{{ serial_console_status }},{{ zerto_status }}"
+
+- name: Write all report lines to CSV
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Write collected lines to CSV
+      lineinfile:
+        path: "{{ report_path }}"
+        line: "{{ hostvars[item].report_line }}"
+        insertafter: EOF
+        create: no
+      loop: "{{ groups['all'] }}"
+      when: hostvars[item].report_line is defined
+
